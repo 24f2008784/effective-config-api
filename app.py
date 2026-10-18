@@ -1,13 +1,21 @@
+
 import os
 from pathlib import Path
-from typing import Optional
 
 import yaml
 from dotenv import dotenv_values
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-BASE_DIR = Path(__file__).resolve().parent
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DEFAULTS = {
     "port": 8000,
@@ -17,33 +25,16 @@ DEFAULTS = {
     "api_key": "default-secret-000",
 }
 
-app = FastAPI(title="Effective Configuration API")
-
-# Allow browser-based graders to call the API from another origin.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+BASE_DIR = Path(__file__).resolve().parent
 
 
-def parse_bool(value) -> bool:
+def to_bool(value):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
 
-def coerce_value(key: str, value):
-    if key in {"port", "workers"}:
-        return int(value)
-    if key == "debug":
-        return parse_bool(value)
-    return str(value)
-
-
-def normalized_key(key: str) -> str:
+def normalize_key(key):
     key = key.strip()
     if key == "NUM_WORKERS":
         return "workers"
@@ -52,61 +43,59 @@ def normalized_key(key: str) -> str:
     return key.lower()
 
 
-def apply_layer(config: dict, layer: dict, *, env_layer: bool = False):
-    for raw_key, value in layer.items():
+def merge_layer(config, layer, os_layer=False):
+    for key, value in layer.items():
         if value is None:
             continue
-        if env_layer:
-            # OS environment layer accepts APP_* only.
-            if not raw_key.startswith("APP_"):
-                continue
-        key = normalized_key(raw_key)
-        config[key] = value
-
-
-def get_effective_config(overrides: Optional[list[str]] = None) -> dict:
-    config = dict(DEFAULTS)
-
-    # Layer 2: environment-specific YAML.
-    environment = os.environ.get("APP_ENV", os.environ.get("ENVIRONMENT", "development"))
-    yaml_path = BASE_DIR / f"config.{environment}.yaml"
-    if yaml_path.exists():
-        with yaml_path.open("r", encoding="utf-8") as handle:
-            yaml_config = yaml.safe_load(handle) or {}
-        if isinstance(yaml_config, dict):
-            apply_layer(config, yaml_config)
-
-    # Layer 3: .env file only. dotenv_values reads the file without mutating
-    # os.environ, so the following OS-environment layer can override it.
-    env_file_values = dotenv_values(BASE_DIR / ".env")
-    apply_layer(config, env_file_values)
-
-    # Layer 4: actual OS environment variables with APP_* prefix.
-    apply_layer(config, dict(os.environ), env_layer=True)
-
-    # Highest precedence: repeated ?set=key=value query parameters.
-    for item in overrides or []:
-        if "=" not in item:
+        if os_layer and not key.startswith("APP_"):
             continue
-        raw_key, value = item.split("=", 1)
-        key = normalized_key(raw_key)
-        if key:
-            config[key] = value
-
-    # Coerce after merging so values from every layer have consistent types.
-    result = {key: coerce_value(key, value) for key, value in config.items()}
-
-    # Never disclose the secret, even if it came from a CLI override.
-    if "api_key" in result:
-        result["api_key"] = "****"
-    return result
+        config[normalize_key(key)] = value
 
 
 @app.get("/")
 def root():
-    return {"service": "effective-config", "endpoint": "/effective-config"}
+    return {"status": "ok"}
 
 
 @app.get("/effective-config")
-def effective_config(set: Optional[list[str]] = Query(default=None)):
-    return get_effective_config(set)
+def effective_config(set: list[str] | None = Query(default=None)):
+    config = DEFAULTS.copy()
+
+    # YAML layer
+    env_name = os.environ.get(
+        "APP_ENV",
+        os.environ.get("ENVIRONMENT", "development")
+    )
+    yaml_path = BASE_DIR / f"config.{env_name}.yaml"
+
+    if yaml_path.exists():
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            yaml_config = yaml.safe_load(f) or {}
+        if isinstance(yaml_config, dict):
+            merge_layer(config, yaml_config)
+
+    # .env layer
+    merge_layer(config, dotenv_values(BASE_DIR / ".env"))
+
+    # OS environment layer
+    merge_layer(config, dict(os.environ), os_layer=True)
+
+    # CLI/query overrides (highest precedence)
+    for item in set or []:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = normalize_key(key)
+        if key in DEFAULTS:
+            config[key] = value
+
+    # Ensure all required keys exist and have the correct types
+    result = {
+        "port": int(config.get("port", 8000)),
+        "workers": int(config.get("workers", 1)),
+        "debug": to_bool(config.get("debug", False)),
+        "log_level": str(config.get("log_level", "info")),
+        "api_key": "****",
+    }
+
+    return result
